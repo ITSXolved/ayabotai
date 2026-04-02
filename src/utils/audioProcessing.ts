@@ -161,7 +161,7 @@ export class AudioRecorder {
 
   private isSpeaking: boolean = false;
   private silenceMs: number = 0;
-  private readonly SILENCE_THRESHOLD = 600; // RMS threshold — filters ambient noise, passes speech
+  private readonly SILENCE_THRESHOLD = 900; // RMS threshold — filters ambient noise, passes speech
   private readonly REQUIRED_SILENCE_MS = 800; // Wait 0.8 seconds of silence before ending turn
 
   get speaking(): boolean {
