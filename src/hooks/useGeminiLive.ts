@@ -3,7 +3,7 @@ import { AudioQueue, AudioRecorder } from '../utils/audioProcessing';
 import { AYADI_SYSTEM_PROMPT } from '../constants/prompts';
 
 const API_KEY = process.env.NEXT_PUBLIC_GEMINI_API_KEY || '';
-const MODEL_NAME = "gemini-3.1-flash-live-preview";
+const MODEL_NAME = "gemini-2.5-flash-native-audio-preview-09-2025";
 const WS_URL = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${API_KEY}`;
 
 export function useGeminiLive() {
