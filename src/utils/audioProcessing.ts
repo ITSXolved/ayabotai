@@ -36,21 +36,49 @@ export function pcm16ToFloat32(pcmData: Uint8Array): Float32Array {
 }
 
 // Very basic inline AudioWorklet code to handle downsampling to 16kHz and packaging as 16-bit PCM.
+// Improved AudioWorklet for noise gating and adaptive floor tracking.
 const AudioWorkletSrc = `
 class PCMProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
-    this.buffer = [];
+    this.noiseFloor = 0.001;
+    this.alpha = 0.005; // EMA for noise tracking
   }
   
   process(inputs, outputs, parameters) {
     const input = inputs[0];
     if (input.length > 0) {
       const channelData = input[0];
-      // Convert Float32 to Int16
+      
+      // Calculate RMS for this chunk
+      let sumSquares = 0;
+      for (let i = 0; i < channelData.length; i++) {
+          sumSquares += channelData[i] * channelData[i];
+      }
+      const rms = Math.sqrt(sumSquares / channelData.length);
+
+      // Adaptively update noise floor
+      if (rms < this.noiseFloor * 2.0) {
+          this.noiseFloor = this.alpha * rms + (1 - this.alpha) * this.noiseFloor;
+      }
+      
+      const dynamicThreshold = Math.max(0.002, this.noiseFloor * 2.5);
+      
+      // Calculate gain with a soft knee / noise gate
+      // Gain is 1.0 if well above noise floor, decays if below.
+      let gain = 1.0;
+      if (rms < dynamicThreshold) {
+          gain = Math.max(0.01, rms / dynamicThreshold);
+          // Apply a square to make the gate sharper
+          gain = gain * gain;
+      }
+
+      // Convert Float32 to Int16 with gain and soft clipping
       const int16Data = new Int16Array(channelData.length);
       for (let i = 0; i < channelData.length; i++) {
-        let s = Math.max(-1, Math.min(1, channelData[i]));
+        let s = channelData[i] * gain;
+        // Soft clipping / limiting
+        s = Math.max(-1, Math.min(1, s));
         int16Data[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
       }
       this.port.postMessage(int16Data.buffer, [int16Data.buffer]);
@@ -124,7 +152,7 @@ export class AudioQueue {
     this.activeSources.forEach(source => {
       try {
         source.stop();
-      } catch (e) {
+      } catch {
         // Ignore if already stopped
       }
     });
@@ -161,8 +189,10 @@ export class AudioRecorder {
 
   private isSpeaking: boolean = false;
   private silenceMs: number = 0;
-  private readonly SILENCE_THRESHOLD = 1400; // RMS threshold — filters ambient noise, passes speech
-  private readonly REQUIRED_SILENCE_MS = 800; // Wait 0.8 seconds of silence before ending turn
+  private smoothedRms: number = 0;
+  private readonly RMS_ALPHA = 0.1; // Smoothing factor for VAD RMS
+  private readonly SILENCE_THRESHOLD = 800; // RMS threshold (after gating)
+  private readonly REQUIRED_SILENCE_MS = 1000; // Wait 1 second of silence before ending turn
 
   get speaking(): boolean {
     return this.isSpeaking;
@@ -178,7 +208,8 @@ export class AudioRecorder {
         channelCount: 1,
         sampleRate: 16000,
         echoCancellation: true,
-        noiseSuppression: true
+        noiseSuppression: true,
+        autoGainControl: true
       } 
     });
 
@@ -186,6 +217,11 @@ export class AudioRecorder {
     this.context = new AudioContextClass({ sampleRate: 16000 });
     
     const source = this.context.createMediaStreamSource(this.stream);
+    
+    // Add a high-pass filter to remove low-frequency noise/hum (below 100Hz)
+    const hpFilter = this.context.createBiquadFilter();
+    hpFilter.type = 'highpass';
+    hpFilter.frequency.value = 100;
     
     const blob = new Blob([AudioWorkletSrc], { type: 'application/javascript' });
     const blobURL = URL.createObjectURL(blob);
@@ -201,18 +237,23 @@ export class AudioRecorder {
         if (this.suppressVAD) {
           this.isSpeaking = false;
           this.silenceMs = 0;
+          this.smoothedRms = 0;
           return;
         }
         
-        // VAD Logic (RMS calculation)
+        // VAD Logic (RMS calculation with smoothing)
         let sumSquares = 0;
         for (let i = 0; i < int16Array.length; i++) {
           sumSquares += int16Array[i] * int16Array[i];
         }
         const rms = Math.sqrt(sumSquares / int16Array.length);
+        
+        // EMA smoothing for RMS to avoid jitter
+        this.smoothedRms = this.RMS_ALPHA * rms + (1 - this.RMS_ALPHA) * this.smoothedRms;
+        
         const chunkDurationMs = (int16Array.length / 16000) * 1000;
 
-        if (rms > this.SILENCE_THRESHOLD) {
+        if (this.smoothedRms > this.SILENCE_THRESHOLD) {
           if (!this.isSpeaking) {
             this.isSpeaking = true;
             if (this.onSpeech) this.onSpeech();
@@ -250,7 +291,8 @@ export class AudioRecorder {
       }
     };
 
-    source.connect(this.workletNode);
+    source.connect(hpFilter);
+    hpFilter.connect(this.workletNode);
     this.workletNode.connect(this.context.destination);
   }
 
