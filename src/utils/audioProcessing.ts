@@ -36,7 +36,7 @@ export function pcm16ToFloat32(pcmData: Uint8Array): Float32Array {
 }
 
 // Very basic inline AudioWorklet code to handle downsampling to 16kHz and packaging as 16-bit PCM.
-// Improved AudioWorklet for noise gating and adaptive floor tracking.
+// Improved AudioWorklet for aggressive noise gating and adaptive floor tracking.
 const AudioWorkletSrc = `
 class PCMProcessor extends AudioWorkletProcessor {
   constructor() {
@@ -62,22 +62,21 @@ class PCMProcessor extends AudioWorkletProcessor {
           this.noiseFloor = this.alpha * rms + (1 - this.alpha) * this.noiseFloor;
       }
       
-      const dynamicThreshold = Math.max(0.002, this.noiseFloor * 2.5);
+      // More aggressive multiplier (4.0x) to block outer mic noise
+      const dynamicThreshold = Math.max(0.003, this.noiseFloor * 4.0);
       
-      // Calculate gain with a soft knee / noise gate
-      // Gain is 1.0 if well above noise floor, decays if below.
+      // Aggressive noise gate
       let gain = 1.0;
       if (rms < dynamicThreshold) {
-          gain = Math.max(0.01, rms / dynamicThreshold);
-          // Apply a square to make the gate sharper
-          gain = gain * gain;
+          gain = Math.max(0, rms / dynamicThreshold);
+          // Cubic curve for sharper cutoff
+          gain = gain * gain * gain;
       }
 
       // Convert Float32 to Int16 with gain and soft clipping
       const int16Data = new Int16Array(channelData.length);
       for (let i = 0; i < channelData.length; i++) {
         let s = channelData[i] * gain;
-        // Soft clipping / limiting
         s = Math.max(-1, Math.min(1, s));
         int16Data[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
       }
@@ -191,8 +190,8 @@ export class AudioRecorder {
   private silenceMs: number = 0;
   private smoothedRms: number = 0;
   private readonly RMS_ALPHA = 0.1; // Smoothing factor for VAD RMS
-  private readonly SILENCE_THRESHOLD = 800; // RMS threshold (after gating)
-  private readonly REQUIRED_SILENCE_MS = 1000; // Wait 1 second of silence before ending turn
+  private readonly SILENCE_THRESHOLD = 1000; // Increased threshold for stability
+  private readonly REQUIRED_SILENCE_MS = 1200; // Slightly longer wait to ensure turn completion
 
   get speaking(): boolean {
     return this.isSpeaking;
@@ -218,10 +217,23 @@ export class AudioRecorder {
     
     const source = this.context.createMediaStreamSource(this.stream);
     
-    // Add a high-pass filter to remove low-frequency noise/hum (below 100Hz)
+    // High-pass filter: 200Hz (blocks low-end rumble and mechanical noise)
     const hpFilter = this.context.createBiquadFilter();
     hpFilter.type = 'highpass';
-    hpFilter.frequency.value = 100;
+    hpFilter.frequency.value = 200;
+
+    // Low-pass filter: 5000Hz (blocks high-end hiss where speech is minimal)
+    const lpFilter = this.context.createBiquadFilter();
+    lpFilter.type = 'lowpass';
+    lpFilter.frequency.value = 5000;
+
+    // Dynamics Compressor: Stabilizes input levels to help VAD and Noise Gate consistency
+    const compressor = this.context.createDynamicsCompressor();
+    compressor.threshold.value = -30;
+    compressor.knee.value = 20;
+    compressor.ratio.value = 12;
+    compressor.attack.value = 0.003;
+    compressor.release.value = 0.25;
     
     const blob = new Blob([AudioWorkletSrc], { type: 'application/javascript' });
     const blobURL = URL.createObjectURL(blob);
@@ -292,7 +304,9 @@ export class AudioRecorder {
     };
 
     source.connect(hpFilter);
-    hpFilter.connect(this.workletNode);
+    hpFilter.connect(lpFilter);
+    lpFilter.connect(compressor);
+    compressor.connect(this.workletNode);
     this.workletNode.connect(this.context.destination);
   }
 
